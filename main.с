@@ -1,0 +1,354 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/i2c.h"
+#include "driver/uart.h"
+#include "driver/ledc.h"
+#include "driver/adc.h"
+#include "esp_timer.h"
+
+static const char *TAG = "FC_MAIN";
+
+// ==================== КОНФИГУРАЦИЯ ПИНОВ ====================
+#define I2C_SDA_PIN         21
+#define I2C_SCL_PIN         22
+#define MPU6050_ADDR        0x68
+
+#define CRSF_UART_NUM       UART_NUM_1
+#define CRSF_TX_PIN         16
+#define CRSF_RX_PIN         17
+#define CRSF_BAUD_RATE      420000
+
+#define ESC_PWM_PINS        {12, 13, 14, 15}
+#define LEDC_TIMER          LEDC_TIMER_0
+#define LEDC_MODE           LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES       LEDC_TIMER_16_BIT
+#define LEDC_FREQ_HZ        200
+
+#define BATT_ADC_PIN        ADC1_CHANNEL_6 // GPIO34
+
+// ==================== КОНСТАНТЫ АЛГОРИТМА ====================
+#define CONTROL_LOOP_HZ     250
+#define MAX_STABILIZE_ANGLE 45.0f  // градусов
+#define YAW_RATE_MAX        200.0f // град/с
+#define THROTTLE_ARM_MIN    1050   // CRSF разброс 172-1811
+#define FAILSAFE_TIMEOUT_MS 300
+#define VOLTAGE_CUTOFF_V    16.0f  // 5S 3.2V/ячейку
+
+// ==================== ГЛОБАЛЬНЫЕ СТРУКТУРЫ ====================
+typedef struct {
+    float roll, pitch, yaw; // углы (град)
+    float gyro_r, gyro_p, gyro_y; // угловые скорости (град/с)
+    float accel_x, accel_y, accel_z;
+} imu_data_t;
+
+typedef struct {
+    float throttle, roll, pitch, yaw; // команды от RC
+    bool valid;
+    uint32_t last_update_ms;
+} rc_data_t;
+
+typedef struct {
+    float kp, ki, kd;
+    float integral;
+    float prev_error;
+} pid_t;
+
+typedef struct {
+    bool armed;
+    float motor_out[4]; // 0..1.0
+    float batt_voltage;
+    uint32_t loop_start_us;
+} fc_state_t;
+
+static imu_data_t imu = {0};
+static rc_data_t rc = {0};
+static fc_state_t fc = {0};
+
+static pid_t pid_roll = {.kp=1.5, .ki=0.05, .kd=0.1};
+static pid_t pid_pitch = {.kp=1.5, .ki=0.05, .kd=0.1};
+static pid_t pid_yaw  = {.kp=2.0, .ki=0.0, .kd=0.15};
+
+// ==================== CRC8 ДЛЯ CRSF =================
+static uint8_t crc8_dvb_s2(uint8_t *data, uint8_t len) {
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x80) crc = (crc << 1) ^ 0xD5;
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+// ==================== I2C иии MPU6050 =================
+static esp_err_t i2c_master_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &conf));
+    return i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+}
+
+static esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t val) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, val, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(10));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t mpu6050_read_block(uint8_t reg, uint8_t *data, size_t len) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    if (len > 1) i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(10));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static void imu_update(void) {
+    uint8_t buf[14];
+    mpu6050_read_block(0x3B, buf, 14); // ACCEL_XOUT_H..TEMP_OUT_H...GYRO_ZOUT_L
+
+    // Масштабирование
+    imu.accel_x = (int16_t)(buf[0] << 8 | buf[1]) / 16384.0f;
+    imu.accel_y = (int16_t)(buf[2] << 8 | buf[3]) / 16384.0f;
+    imu.accel_z = (int16_t)(buf[4] << 8 | buf[5]) / 16384.0f;
+
+    imu.gyro_r  = (int16_t)(buf[8] << 8 | buf[9]) / 131.0f;
+    imu.gyro_p  = (int16_t)(buf[10] << 8 | buf[11]) / 131.0f;
+    imu.gyro_y  = (int16_t)(buf[12] << 8 | buf[13]) / 131.0f;
+
+    // Комплементарный фильтр для roll/pitch
+    float dt = 1.0f / CONTROL_LOOP_HZ;
+    float accel_roll  = atan2f(imu.accel_y, imu.accel_z) * 180.0f / M_PI;
+    float accel_pitch = atan2f(-imu.accel_x, sqrtf(imu.accel_y*imu.accel_y + imu.accel_z*imu.accel_z)) * 180.0f / M_PI;
+
+    imu.roll  = 0.98f * (imu.roll  + imu.gyro_r  * dt) + 0.02f * accel_roll;
+    imu.pitch = 0.98f * (imu.pitch + imu.gyro_p  * dt) + 0.02f * accel_pitch;
+    imu.yaw  += imu.gyro_y * dt;
+}
+
+// ==================== UART иии CRSF ====================
+static void crsf_uart_init(void) {
+    uart_config_t uart_config = {
+        .baud_rate = CRSF_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+    uart_driver_install(CRSF_UART_NUM, 256, 256, 0, NULL, 0);
+    uart_param_config(CRSF_UART_NUM, &uart_config);
+    uart_set_pin(CRSF_UART_NUM, CRSF_TX_PIN, CRSF_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+static void crsf_parse(uint8_t *buf, int len) {
+    // парсер заголовка 0xC8, длина 0x18, тип 0x16
+    for (int i = 0; i < len - 25; i++) {
+        if (buf[i] == 0xC8 && buf[i+1] == 0x18 && buf[i+2] == 0x16) {
+            uint8_t crc = crc8_dvb_s2(buf + i + 2, 23);
+            if (buf[i + 25] == crc) {
+                // декод. каналов CRSF 11 бит на канал
+                uint16_t raw[12];
+                uint8_t idx = 0;
+                for (int ch = 0; ch < 16; ch++) {
+                    int bit = ch * 11;
+                    int byte = bit / 8;
+                    int offset = bit % 8;
+                    raw[ch] = ((buf[i+3+byte] << 8) | buf[i+3+byte+1]) >> offset;
+                    if (offset > 5) raw[ch] |= (buf[i+3+byte+2] << (16 - offset));
+                    raw[ch] &= 0x7FF;
+                }
+
+                // Нормализация 0 1 (CRSF 172..1811, центр ~992)
+                rc.throttle = (float)(raw[2] - 172) / (1811 - 172);
+                rc.roll     = (float)(raw[0] - 992) / 819.0f; // -1..1
+                rc.pitch    = (float)(raw[1] - 992) / 819.0f;
+                rc.yaw      = (float)(raw[3] - 992) / 819.0f;
+
+                rc.valid = true;
+                rc.last_update_ms = esp_timer_get_time() / 1000;
+                return;
+            }
+        }
+    }
+    rc.valid = false;
+}
+
+// ==================== ADC иии аккум ====================
+static void battery_adc_init(void) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(BATT_ADC_PIN, ADC_ATTEN_DB_11);
+}
+
+static float battery_read_voltage(void) {
+    int raw = adc1_get_raw(BATT_ADC_PIN);
+
+    float adc_v = (raw / 4095.0f) * 3.3f;
+    return adc_v * 10.0f;
+}
+
+// =============== PWM иии ESC ====================
+static void esc_pwm_init(void) {
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .freq_hz          = LEDC_FREQ_HZ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    int pins[] = ESC_PWM_PINS;
+    for (int ch = 0; ch < 4; ch++) {
+        ledc_channel_config_t ledc_channel = {
+            .speed_mode     = LEDC_MODE,
+            .channel        = ch,
+            .timer_sel      = LEDC_TIMER,
+            .intr_type      = LEDC_INTR_DISABLE,
+            .gpio_num       = pins[ch],
+            .duty           = 0,
+            .hpoint         = 0
+        };
+        ledc_channel_config(&ledc_channel);
+    }
+}
+
+static void esc_set_duties(float m1, float m2, float m3, float m4) {
+    uint32_t duty1 = (uint32_t)(m1 * 65535.0f);
+    uint32_t duty2 = (uint32_t)(m2 * 65535.0f);
+    uint32_t duty3 = (uint32_t)(m3 * 65535.0f);
+    uint32_t duty4 = (uint32_t)(m4 * 65535.0f);
+
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, duty1);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_1, duty2);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_2, duty3);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_3, duty4);
+
+    for (int i = 0; i < 4; i++) ledc_update_duty(LEDC_MODE, i);
+}
+
+// ============== PID иии CONTROL ================
+static float pid_compute(pid_t *pid, float error, float dt) {
+    pid->integral += error * dt;
+    // Anti-windup
+    if (pid->integral > 50.0f) pid->integral = 50.0f;
+    if (pid->integral < -50.0f) pid->integral = -50.0f;
+
+    float derivative = (error - pid->prev_error) / dt;
+    pid->prev_error = error;
+    return pid->kp * error + pid->ki * pid->integral + pid->kd * derivative;
+}
+
+static void control_loop_task(void *arg) {
+    uint8_t uart_buf[128];
+    int uart_len = 0;
+    uint32_t loop_time_us = 1000000 / CONTROL_LOOP_HZ;
+    uint32_t last_tick = esp_timer_get_time();
+
+    while (1) {
+        uint32_t now = esp_timer_get_time();
+        float dt = (now - last_tick) / 1000000.0f;
+        last_tick = now;
+
+        // 1 чтение RC
+        uart_len = uart_read_bytes(CRSF_UART_NUM, uart_buf, sizeof(uart_buf), 0);
+        if (uart_len > 0) crsf_parse(uart_buf, uart_len);
+
+        if (!rc.valid || (esp_timer_get_time()/1000 - rc.last_update_ms) > FAILSAFE_TIMEOUT_MS) {
+            fc.armed = false;
+            esc_set_duties(0,0,0,0);
+            vTaskDelay(pdMS_TO_TICKS(loop_time_us/1000));
+            continue;
+        }
+
+        // 2 обновление IMU
+        imu_update();
+
+        // 3 логика арминга газ < 10%, стики по центру, рысканье влево/вправо для арм/ disarm
+        static bool yaw_prev = false;
+        bool yaw_left = rc.yaw < -0.8f;
+        bool yaw_right = rc.yaw > 0.8f;
+        bool low_throttle = rc.throttle < 0.05f;
+        bool centered = fabsf(rc.roll) < 0.1f && fabsf(rc.pitch) < 0.1f;
+
+        if (!fc.armed && low_throttle && centered && yaw_left && !yaw_prev) fc.armed = true;
+        if (fc.armed && low_throttle && yaw_right && !yaw_prev) fc.armed = false;
+        yaw_prev = (yaw_left || yaw_right);
+
+        // 4 аккум
+        fc.batt_voltage = battery_read_voltage();
+        if (fc.batt_voltage < VOLTAGE_CUTOFF_V) fc.armed = false;
+
+        // 5 Пид
+        float roll_err  = rc.roll * MAX_STABILIZE_ANGLE - imu.roll;
+        float pitch_err = rc.pitch * MAX_STABILIZE_ANGLE - imu.pitch;
+        float yaw_rate_cmd = rc.yaw * YAW_RATE_MAX;
+        float yaw_err = yaw_rate_cmd - imu.gyro_y; // rate control for yaw
+
+        float pid_r = pid_compute(&pid_roll, roll_err, dt);
+        float pid_p = pid_compute(&pid_pitch, pitch_err, dt);
+        float pid_y = pid_compute(&pid_yaw, yaw_err, dt);
+
+        // 6 микширование
+        float thr = rc.throttle;
+        float m1 = thr - pid_p - pid_r - pid_y; // Front Left
+        float m2 = thr - pid_p + pid_r + pid_y; // Front Right
+        float m3 = thr + pid_p + pid_r - pid_y; // Back Left
+        float m4 = thr + pid_p - pid_r + pid_y; // Back Right
+
+        // ограничение 0 1
+        m1 = fmaxf(0.0f, fminf(1.0f, m1));
+        m2 = fmaxf(0.0f, fminf(1.0f, m2));
+        m3 = fmaxf(0.0f, fminf(1.0f, m3));
+        m4 = fmaxf(0.0f, fminf(1.0f, m4));
+
+        if (!fc.armed) { m1=m2=m3=m4=0; }
+        esc_set_duties(m1, m2, m3, m4);
+
+
+        // задержка до следующего цикла
+        int32_t sleep_us = loop_time_us - (esp_timer_get_time() - now);
+        if (sleep_us > 0) vTaskDelay(pdMS_TO_TICKS(sleep_us / 1000));
+    }
+}
+
+// ==================== мейн ====================
+void app_main(void) {
+    ESP_LOGI(TAG, "ESP32 FC Initializing...");
+
+    i2c_master_init();
+    mpu6050_write_reg(0x6B, 0x00); 
+    mpu6050_write_reg(0x1A, 0x03); 
+    mpu6050_write_reg(0x1C, 0x00); 
+    mpu6050_write_reg(0x1B, 0x00);
+
+    crsf_uart_init();
+    battery_adc_init();
+    esc_pwm_init();
+
+    xTaskCreatePinnedToCore(control_loop_task, "fc_ctrl", 4096, NULL, 5, NULL, 1);
+
+}
